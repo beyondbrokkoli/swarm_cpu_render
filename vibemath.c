@@ -1788,6 +1788,7 @@ EXPORT void vmath_render_batch(
             vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]);
         }
         vmath_mutex_unlock(&g_band_mutex[b]);
+    }
 }
 
 // A dead-simple scalar sphere. No noise, no SIMD, purely a stable target for our Transition Weaving tests.
@@ -1973,7 +1974,7 @@ EXPORT void vmath_execute_queue(
 ) {
     // ZERO-IS-INITIALIZATION SAFETY CHECK
     // If Lua hasn't bound the engine or there are no commands, do nothing safely.
-    if (!g_mem || !g_screen_ptr || command_count == 0) return;
+    // if (!g_mem || !g_screen_ptr || command_count == 0) return;
 
     // 1. Setup physics payload using GLOBALS
     g_physics_payload.command_count = command_count;
@@ -2014,7 +2015,8 @@ EXPORT void vmath_execute_queue(
                     g_mem->Vert_LY + g_mem->Obj_VertStart[0],
                     g_mem->Vert_LZ + g_mem->Obj_VertStart[0],
                     120.0f,
-                    g_cam, g_half_w, g_half_h // USING GLOBALS
+                    g_cam, g_half_w, g_half_h, // USING GLOBALS
+                    g_mem->Swarm_Indices[read_idx] // <--- ADD THIS!
                 );
                 break;
 

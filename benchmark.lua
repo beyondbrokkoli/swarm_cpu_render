@@ -2,7 +2,7 @@
 local Benchmark = {}
 
 -- Toggle this to false to return to free-roam mode!
-Benchmark.active = false
+Benchmark.active = true
 
 Benchmark.time = 0
 Benchmark.frames = 0

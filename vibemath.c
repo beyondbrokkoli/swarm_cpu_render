@@ -301,7 +301,105 @@ EXPORT void vmath_clear_buffers(
         zbuffer[i] = clear_z;
     }
 }
+// ========================================================
+// THE 500K POINT CLOUD RENDERER
+// ========================================================
+EXPORT void vmath_render_point_cloud(
+    int count, 
+    float* px, float* py, float* pz, // Swarm Positions
+    uint32_t color                   // Base color for the swarm
+) {
+    float cpx = g_cam->x, cpy = g_cam->y, cpz = g_cam->z;
+    float cfw_x = g_cam->fwx, cfw_y = g_cam->fwy, cfw_z = g_cam->fwz;
+    float crt_x = g_cam->rtx, crt_z = g_cam->rtz;
+    float cup_x = g_cam->upx, cup_y = g_cam->upy, cup_z = g_cam->upz;
+    float cam_fov = g_cam->fov;
+    
+    // We will borrow Vert_PX, PY, PZ to store the screen coords so we don't need new memory
+    float* sx = g_mem->Vert_PX;
+    float* sy = g_mem->Vert_PY;
+    float* sz = g_mem->Vert_PZ;
 
+    int band_counts[4] = {0, 0, 0, 0};
+
+    // --- PHASE 1: AVX2 DIRECT PROJECTION ---
+    int i = 0;
+    for (; i < count; i++) {
+        float dx = px[i] - cpx;
+        float dy = py[i] - cpy;
+        float dz = pz[i] - cpz;
+        
+        float cz = dx*cfw_x + dy*cfw_y + dz*cfw_z;
+
+        // Behind camera? Skip it completely.
+        if (cz < 0.1f) {
+            g_mem->Vert_Valid[i] = false;
+            continue; 
+        }
+
+        float f = cam_fov / cz;
+        float screen_x = g_half_w + (dx*crt_x + dz*crt_z) * f;
+        float screen_y = g_half_h + (dx*cup_x + dy*cup_y + dz*cup_z) * f;
+
+        // Out of screen bounds? Skip it.
+        if (screen_x < 0 || screen_x >= g_canvas_w || screen_y < 0 || screen_y >= g_canvas_h) {
+            g_mem->Vert_Valid[i] = false;
+            continue;
+        }
+
+        // Store the valid screen coordinates
+        sx[i] = screen_x;
+        sy[i] = screen_y;
+        sz[i] = cz;
+        g_mem->Vert_Valid[i] = true;
+
+        // --- PHASE 1.5: THE QUAD BINNER ---
+        // Instantly sort the valid point into its correct Raster Thread Band
+        int m0 = (screen_y < g_q1);
+        int m1 = (screen_y >= g_q1) & (screen_y < g_q2);
+        int m2 = (screen_y >= g_q2) & (screen_y < g_q3);
+        int m3 = (screen_y >= g_q3);
+
+        g_BandLists[0][band_counts[0]] = i;
+        g_BandLists[1][band_counts[1]] = i;
+        g_BandLists[2][band_counts[2]] = i;
+        g_BandLists[3][band_counts[3]] = i;
+
+        band_counts[0] += m0;
+        band_counts[1] += m1;
+        band_counts[2] += m2;
+        band_counts[3] += m3;
+    }
+
+    // --- PHASE 2: WAKE UP THREADS TO PLOT PIXELS ---
+    // (We will write a new worker function for this, but dispatch looks identical)
+    for (int b = 0; b < 4; b++) {
+        g_raster_payloads[b].display_list = g_BandLists[b];
+        g_raster_payloads[b].list_count = band_counts[b];
+        g_raster_payloads[b].mem = g_mem;
+        g_raster_payloads[b].ScreenPtr = g_screen_ptr;
+        g_raster_payloads[b].ZBuffer = g_z_buffer;
+        g_raster_payloads[b].CANVAS_W = g_canvas_w;
+        
+        // We temporarily hijack the "min_clip_y" payload variable to pass the color!
+        g_raster_payloads[b].min_clip_y = color; 
+
+        vmath_mutex_lock(&g_band_mutex[b]);
+        g_band_done[b] = 0;
+        g_band_sig[b] = 3; // <--- NEW SIGNAL: '3' MEANS DRAW POINTS!
+        vmath_cond_broadcast(&g_band_cv_start[b]);
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
+
+    // SYNCHRONIZATION
+    for (int b = 0; b < 4; b++) {
+        vmath_mutex_lock(&g_band_mutex[b]);
+        while (g_band_done[b] == 0) {
+            vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]);
+        }
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
+}
 EXPORT void vmath_project_vertices(
     int count,
     // Inputs (Local Coords)
@@ -569,8 +667,6 @@ EXPORT void vmath_process_triangles(
         float wny = lnx * ry + lny * uy + lnz * fy;
         float wnz = lnx * rz + lny * uz + lnz * fz;
 
-        // [SQUARE ROOT DELETED] - We are ALREADY normalized!
-
         // 3. Lambertian Lighting (Dot Product)
         float dot = wnx * sun_x + wny * sun_y + wnz * sun_z;
         float light = dot < 0.2f ? 0.2f : (dot > 1.0f ? 1.0f : dot);
@@ -583,6 +679,205 @@ EXPORT void vmath_process_triangles(
         tri_valid[i] = true;
     }
 }
+#define USE_NEW_RASTERIZE 1
+#if USE_NEW_RASTERIZE
+EXPORT void vmath_rasterize_list(
+    int* display_list, int list_count,
+    int* v1, int* v2, int* v3,
+    float* px, float* py, float* pz,
+    uint32_t* shaded_color,
+    uint32_t* screen_buffer, float* z_buffer,
+    int canvas_w, int canvas_h,
+    int min_clip_y, int max_clip_y
+) {
+    for (int k = 0; k < list_count; k++) {
+        int i = display_list[k];
+
+        int i1 = v1[i], i2 = v2[i], i3 = v3[i];
+        float x1 = px[i1], y1 = py[i1], z1 = pz[i1];
+        float x2 = px[i2], y2 = py[i2], z2 = pz[i2];
+        float x3 = px[i3], y3 = py[i3], z3 = pz[i3];
+
+        __m256i v_color = _mm256_set1_epi32((int)shaded_color[i]);
+
+        // 1. Sort Vertices by Y (Top to Bottom)
+        if (y1 > y2) { float t=x1; x1=x2; x2=t;  t=y1; y1=y2; y2=t;  t=z1; z1=z2; z2=t; }
+        if (y1 > y3) { float t=x1; x1=x3; x3=t;  t=y1; y1=y3; y3=t;  t=z1; z1=z3; z3=t; }
+        if (y2 > y3) { float t=x2; x2=x3; x3=t;  t=y2; y2=y3; y3=t;  t=z2; z2=z3; z3=t; }
+
+        float total_height = y3 - y1;
+        if (total_height <= 0.0f) continue;
+
+        int y_start = (int)fmaxf((float)min_clip_y, ceilf(y1));
+        int y_end   = (int)fminf((float)max_clip_y, floorf(y3));
+
+        if (y_start > y_end) continue;
+
+        // --- THE MASSIVE OPTIMIZATION: CONSTANT Z-STEP ---
+        // Calculate the triangle's surface normal to find dz/dx.
+        // This eliminates division inside the scanline loop completely!
+        float dx1_0 = x2 - x1, dy1_0 = y2 - y1, dz1_0 = z2 - z1;
+        float dx2_0 = x3 - x1, dy2_0 = y3 - y1, dz2_0 = z3 - z1;
+
+        // Cross Product Z component (Area) and X component
+        float nz = dx1_0 * dy2_0 - dy1_0 * dx2_0;
+        float nx = dy1_0 * dz2_0 - dz1_0 * dy2_0;
+
+        // dz/dx is constant for the entire triangle!
+        float z_step = (nz != 0.0f) ? (-nx / nz) : 0.0f;
+
+        __m256 v_z_step8 = _mm256_set1_ps(z_step * 8.0f);
+
+        // Pre-calculate the total edge slopes
+        float inv_total = 1.0f / total_height;
+        float dx_total = (x3 - x1) * inv_total;
+        float dz_total = (z3 - z1) * inv_total;
+
+        // ==========================================
+        // UPPER TRIANGLE (DDA Edge Stepping)
+        // ==========================================
+        float dy_upper = y2 - y1;
+        if (dy_upper > 0.0f) {
+            float inv_upper = 1.0f / dy_upper;
+            float dx_upper = (x2 - x1) * inv_upper;
+            float dz_upper = (z2 - z1) * inv_upper;
+
+            int limit_y = (int)fminf((float)y_end, floorf(y2));
+
+            // Fast-forward the edges to the first visible scanline
+            float y_diff = (float)y_start - y1;
+            float ax = x1 + dx_total * y_diff;
+            float az = z1 + dz_total * y_diff;
+            float bx = x1 + dx_upper * y_diff;
+            float bz = z1 + dz_upper * y_diff;
+
+            for (int y = y_start; y <= limit_y; y++) {
+                float left_x = ax, right_x = bx;
+                float left_z = az;
+
+                if (left_x > right_x) {
+                    float t = left_x; left_x = right_x; right_x = t;
+                    left_z = bz; // Only need the Z of the left-most edge
+                }
+
+                int start_x = (int)fmaxf(0.0f, ceilf(left_x));
+                int end_x   = (int)fminf((float)(canvas_w - 1), floorf(right_x));
+
+                if (end_x >= start_x) {
+                    // Start Z from the exact sub-pixel start_x
+                    float current_z = left_z + z_step * ((float)start_x - left_x);
+                    int off = y * canvas_w;
+                    int x = start_x;
+
+                    // AVX2 Loop
+                    __m256 v_current_z = _mm256_set_ps(
+                        current_z + z_step*7.0f, current_z + z_step*6.0f,
+                        current_z + z_step*5.0f, current_z + z_step*4.0f,
+                        current_z + z_step*3.0f, current_z + z_step*2.0f,
+                        current_z + z_step*1.0f, current_z
+                    );
+
+                    for (; x <= end_x - 7; x += 8) {
+                        __m256 v_old_z = _mm256_loadu_ps(&z_buffer[off + x]);
+                        __m256 v_cmp = _mm256_cmp_ps(v_current_z, v_old_z, _CMP_LT_OQ);
+                        __m256i v_mask = _mm256_castps_si256(v_cmp);
+
+                        _mm256_maskstore_ps(&z_buffer[off + x], v_mask, v_current_z);
+                        _mm256_maskstore_epi32((int*)&screen_buffer[off + x], v_mask, v_color);
+
+                        v_current_z = _mm256_add_ps(v_current_z, v_z_step8);
+                    }
+
+                    // Scalar Tail Loop
+                    current_z = left_z + z_step * ((float)x - left_x); 
+                    for (; x <= end_x; x++) {
+                        if (current_z < z_buffer[off + x]) {
+                            z_buffer[off + x] = current_z;
+                            screen_buffer[off + x] = (uint32_t)shaded_color[i];
+                        }
+                        current_z += z_step;
+                    }
+                }
+
+                // DDA Edge Step: Just ADD the slopes for the next scanline! (No multiplication!)
+                ax += dx_total; az += dz_total;
+                bx += dx_upper; bz += dz_upper;
+            }
+        }
+
+        // ==========================================
+        // LOWER TRIANGLE (DDA Edge Stepping)
+        // ==========================================
+        float dy_lower = y3 - y2;
+        if (dy_lower > 0.0f) {
+            float inv_lower = 1.0f / dy_lower;
+            float dx_lower = (x3 - x2) * inv_lower;
+            float dz_lower = (z3 - z2) * inv_lower;
+
+            int start_y = (int)fmaxf((float)y_start, ceilf(y2));
+
+            // Fast-forward edges to the first visible scanline of the lower half
+            float y_diff_total = (float)start_y - y1;
+            float y_diff_lower = (float)start_y - y2;
+
+            float ax = x1 + dx_total * y_diff_total;
+            float az = z1 + dz_total * y_diff_total;
+            float bx = x2 + dx_lower * y_diff_lower;
+            float bz = z2 + dz_lower * y_diff_lower;
+
+            for (int y = start_y; y <= y_end; y++) {
+                float left_x = ax, right_x = bx;
+                float left_z = az;
+
+                if (left_x > right_x) {
+                    float t = left_x; left_x = right_x; right_x = t;
+                    left_z = bz;
+                }
+
+                int start_x = (int)fmaxf(0.0f, ceilf(left_x));
+                int end_x   = (int)fminf((float)(canvas_w - 1), floorf(right_x));
+
+                if (end_x >= start_x) {
+                    float current_z = left_z + z_step * ((float)start_x - left_x);
+                    int off = y * canvas_w;
+                    int x = start_x;
+
+                    __m256 v_current_z = _mm256_set_ps(
+                        current_z + z_step*7.0f, current_z + z_step*6.0f,
+                        current_z + z_step*5.0f, current_z + z_step*4.0f,
+                        current_z + z_step*3.0f, current_z + z_step*2.0f,
+                        current_z + z_step*1.0f, current_z
+                    );
+
+                    for (; x <= end_x - 7; x += 8) {
+                        __m256 v_old_z = _mm256_loadu_ps(&z_buffer[off + x]);
+                        __m256 v_cmp = _mm256_cmp_ps(v_current_z, v_old_z, _CMP_LT_OQ);
+                        __m256i v_mask = _mm256_castps_si256(v_cmp);
+
+                        _mm256_maskstore_ps(&z_buffer[off + x], v_mask, v_current_z);
+                        _mm256_maskstore_epi32((int*)&screen_buffer[off + x], v_mask, v_color);
+
+                        v_current_z = _mm256_add_ps(v_current_z, v_z_step8);
+                    }
+
+                    current_z = left_z + z_step * ((float)x - left_x);
+                    for (; x <= end_x; x++) {
+                        if (current_z < z_buffer[off + x]) {
+                            z_buffer[off + x] = current_z;
+                            screen_buffer[off + x] = (uint32_t)shaded_color[i];
+                        }
+                        current_z += z_step;
+                    }
+                }
+
+                // DDA Edge Step
+                ax += dx_total; az += dz_total;
+                bx += dx_lower; bz += dz_lower;
+            }
+        }
+    }
+}
+#else
 EXPORT void vmath_rasterize_list(
     int* display_list, int list_count,
     int* v1, int* v2, int* v3,
@@ -739,7 +1034,7 @@ EXPORT void vmath_rasterize_list(
         }
     }
 }
-
+#endif
 // ========================================================================
 // SWARM PHYSICS (The Particle Baseline)
 // ========================================================================
@@ -1634,6 +1929,91 @@ EXPORT void vmath_swarm_smales(
 // ========================================================
 // CORE 3+: OS-SLEEPING RASTER WORKERS
 // ========================================================
+EXPORT void vmath_plot_points(
+    int* display_list, int list_count,
+    float* sx, float* sy, float* sz,
+    uint32_t color,
+    uint32_t* screen_buffer, float* z_buffer,
+    int canvas_w
+) {
+    for (int k = 0; k < list_count; k++) {
+        int i = display_list[k]; // The particle ID
+        
+        int x = (int)sx[i];
+        int y = (int)sy[i];
+        float depth = sz[i];
+
+        int offset = y * canvas_w + x;
+
+        // Standard Depth Test
+        if (depth < z_buffer[offset]) {
+            z_buffer[offset] = depth;
+            screen_buffer[offset] = color;
+            
+            // BONUS: To make points look better at 1080p, you can plot a 2x2 "Splat" 
+            // by uncommenting the lines below (assuming bounds are safe):
+            // screen_buffer[offset + 1] = color;
+            // screen_buffer[offset + canvas_w] = color;
+            // screen_buffer[offset + canvas_w + 1] = color;
+        }
+    }
+}
+#define POINT_CLOUD 1
+#if POINT_CLOUD
+THREAD_FUNC vmath_raster_worker(void* arg) {
+    int band_id = (int)(intptr_t)arg;
+    RasterThreadPayload* p = &g_raster_payloads[band_id];
+
+    while (1) {
+        // 1. LOCK & SLEEP
+        vmath_mutex_lock(&g_band_mutex[band_id]);
+        while (g_band_sig[band_id] == 0) {
+            vmath_cond_wait(&g_band_cv_start[band_id], &g_band_mutex[band_id]);
+        }
+        // 2. CHECK FOR QUIT SIGNAL
+        if (g_band_sig[band_id] == 2) {
+            vmath_mutex_unlock(&g_band_mutex[band_id]);
+            break;
+        }
+
+        int current_signal = g_band_sig[band_id]; // Store the signal so we know what to do!
+        vmath_mutex_unlock(&g_band_mutex[band_id]);
+
+        RenderMemory* mem = p->mem;
+
+        if (current_signal == 1) {
+            // THE OLD WAY: Draw Triangles
+            vmath_rasterize_list(
+                p->display_list, p->list_count,
+                mem->Tri_V1, mem->Tri_V2, mem->Tri_V3,
+                mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ,
+                mem->Tri_ShadedColor,
+                p->ScreenPtr, p->ZBuffer, p->CANVAS_W, p->CANVAS_H,
+                p->min_clip_y, p->max_clip_y
+            );
+        }
+        else if (current_signal == 3) {
+            // THE NEW WAY: Draw Point Clouds!
+            uint32_t passed_color = (uint32_t)p->min_clip_y; // Unpack our color
+            vmath_plot_points(
+                p->display_list, p->list_count,
+                mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ,
+                passed_color,
+                p->ScreenPtr, p->ZBuffer, p->CANVAS_W
+            );
+        }
+
+        // ... [Wake up main thread] ...
+        // 4. WORK FINISHED: Wake up main thread
+        vmath_mutex_lock(&g_band_mutex[band_id]);
+        g_band_sig[band_id] = 0;
+        g_band_done[band_id] = 1;
+        vmath_cond_broadcast(&g_band_cv_done[band_id]);
+        vmath_mutex_unlock(&g_band_mutex[band_id]);
+    }
+    return THREAD_RETURN_VAL;
+}
+#else
 THREAD_FUNC vmath_raster_worker(void* arg) {
     int band_id = (int)(intptr_t)arg;
     RasterThreadPayload* p = &g_raster_payloads[band_id];
@@ -1672,6 +2052,7 @@ THREAD_FUNC vmath_raster_worker(void* arg) {
     }
     return THREAD_RETURN_VAL;
 }
+#endif
 // ========================================================
 // PHASE 2: ATOMIC DISPATCH REWRITE
 // ========================================================
@@ -2027,6 +2408,16 @@ EXPORT void vmath_execute_queue(
                 vmath_render_batch(id, id, sun_x, sun_y, sun_z);
                 break;
             }
+
+            case 15: // CMD_RENDER_POINT_CLOUD
+                vmath_render_point_cloud(
+                    swarm_count, // If this is 500k, AVX will melt through it!
+                    g_mem->Swarm_PX[read_idx],
+                    g_mem->Swarm_PY[read_idx],
+                    g_mem->Swarm_PZ[read_idx],
+                    0xFF00FFFF // Cyan points! You can parameterize this later.
+                );
+                break;
         }
     }
 

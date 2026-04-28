@@ -27,7 +27,8 @@ local CMD = {
     RENDER_CULL = 11,
     SWARM_EXPLOSION_PUSH = 12,
     SWARM_EXPLOSION_PULL = 13,
-    SWARM_SORT_DEPTH = 14
+    SWARM_SORT_DEPTH = 14,
+    RENDER_POINT_CLOUD = 15
 }
 local pendingResize = false
 local resizeTimer = 0.0
@@ -125,10 +126,11 @@ function love.draw()
     -- 5. SORT FRONT-TO-BACK
     q[q_len] = CMD.SWARM_SORT_DEPTH; q_len = q_len + 1
     -- 6. GENERATE GEOMETRY
-    q[q_len] = CMD.SWARM_GEN_QUADS; q_len = q_len + 1
+    -- q[q_len] = CMD.SWARM_GEN_QUADS; q_len = q_len + 1
 
     -- 7. RENDER THE SWARM
-    q[q_len] = CMD.RENDER_CULL; q_len = q_len + 1
+    --q[q_len] = CMD.RENDER_CULL; q_len = q_len + 1
+    q[q_len] = CMD.RENDER_POINT_CLOUD; q_len = q_len + 1
     q[q_len] = 0;               q_len = q_len + 1 -- Pass ID 0 as argument
 
     -- Ping-Pong the buffers!

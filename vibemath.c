@@ -231,6 +231,46 @@ typedef struct {
 RasterThreadPayload g_raster_payloads[NUM_BANDS];
 vmath_thread_t g_raster_threads[NUM_BANDS];
 
+// Zero-initialized automatically by the OS (.bss segment)
+uint32_t* g_screen_ptr;
+float* g_z_buffer;
+int       g_canvas_w;
+int       g_canvas_h;
+float     g_half_w;
+float     g_half_h;
+float g_q1;
+float g_q2;
+float g_q3;
+float g_band_height;
+RenderMemory* g_mem ;
+CameraState* g_cam;
+int* g_queue;
+
+EXPORT void vmath_bind_engine(RenderMemory* mem, CameraState* cam, int* queue) {
+    g_mem = mem;
+    g_cam = cam;
+    g_queue = queue;
+}
+
+EXPORT void vmath_set_resolution(
+    int w, int h,
+    uint32_t* screen_ptr,
+    float* z_buffer
+) {
+    g_canvas_w = w;
+    g_canvas_h = h;
+    g_half_w = w * 0.5f;
+    g_half_h = h * 0.5f;
+
+    g_screen_ptr = screen_ptr;
+    g_z_buffer = z_buffer;
+
+    // quad binning float updates
+    g_q1 = h * 0.25f;
+    g_q2 = h * 0.50f;
+    g_q3 = h * 0.75f;
+    g_band_height = h * 0.25f;
+}
 // ========================================================================
 // MEMORY & PROJECTION (The Core Pipeline)
 // ========================================================================
@@ -1597,27 +1637,27 @@ EXPORT void vmath_swarm_smales(
 THREAD_FUNC vmath_raster_worker(void* arg) {
     int band_id = (int)(intptr_t)arg;
     RasterThreadPayload* p = &g_raster_payloads[band_id];
-    
+
     while (1) {
         // 1. LOCK & SLEEP
         vmath_mutex_lock(&g_band_mutex[band_id]);
-        while (g_band_sig[band_id] == 0) { 
-            vmath_cond_wait(&g_band_cv_start[band_id], &g_band_mutex[band_id]); 
+        while (g_band_sig[band_id] == 0) {
+            vmath_cond_wait(&g_band_cv_start[band_id], &g_band_mutex[band_id]);
         }
-        
+
         // 2. CHECK FOR QUIT SIGNAL
         if (g_band_sig[band_id] == 2) {
             vmath_mutex_unlock(&g_band_mutex[band_id]);
-            break; 
+            break;
         }
-        vmath_mutex_unlock(&g_band_mutex[band_id]); 
+        vmath_mutex_unlock(&g_band_mutex[band_id]);
 
         // 3. DO THE HEAVY LIFTING
         RenderMemory* mem = p->mem;
         vmath_rasterize_list(
             p->display_list, p->list_count,
             mem->Tri_V1, mem->Tri_V2, mem->Tri_V3,
-            mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ, 
+            mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ,
             mem->Tri_ShadedColor,
             p->ScreenPtr, p->ZBuffer, p->CANVAS_W, p->CANVAS_H,
             p->min_clip_y, p->max_clip_y
@@ -1635,111 +1675,103 @@ THREAD_FUNC vmath_raster_worker(void* arg) {
 // ========================================================
 // PHASE 2: ATOMIC DISPATCH REWRITE
 // ========================================================
+// THE ULTIMATE LEAN SIGNATURE: Only 5 arguments!
 EXPORT void vmath_render_batch(
     int start_id, int end_id,
-    CameraState* cam, float HALF_W, float HALF_H, float sun_x, float sun_y, float sun_z,
-    RenderMemory* mem, uint32_t* ScreenPtr, float* ZBuffer, int CANVAS_W, int CANVAS_H
+    float sun_x, float sun_y, float sun_z
 ) {
-    // ... [KEEP PHASE 1: AVX Projection & Process Triangles exactly the same] ...
-    float cpx = cam->x, cpy = cam->y, cpz = cam->z;
-    float cfw_x = cam->fwx, cfw_y = cam->fwy, cfw_z = cam->fwz;
-    float crt_x = cam->rtx, crt_z = cam->rtz;
-    float cup_x = cam->upx, cup_y = cam->upy, cup_z = cam->upz;
-    float cam_fov = cam->fov;
+    // 1. Read camera variables directly from the bound g_cam!
+    float cpx = g_cam->x, cpy = g_cam->y, cpz = g_cam->z;
+    float cfw_x = g_cam->fwx, cfw_y = g_cam->fwy, cfw_z = g_cam->fwz;
+    float crt_x = g_cam->rtx, crt_z = g_cam->rtz;
+    float cup_x = g_cam->upx, cup_y = g_cam->upy, cup_z = g_cam->upz;
+    float cam_fov = g_cam->fov;
 
     // --- PHASE 1: MAIN THREAD DOES PROJECTION AND LIGHTING ---
     for (int id = start_id; id <= end_id; id++) {
-        float r = mem->Obj_Radius[id];
-        float ox = mem->Obj_X[id], oy = mem->Obj_Y[id], oz = mem->Obj_Z[id];
+        // Read directly from the bound g_mem!
+        float r = g_mem->Obj_Radius[id];
+        float ox = g_mem->Obj_X[id], oy = g_mem->Obj_Y[id], oz = g_mem->Obj_Z[id];
 
         float cz_center = (ox - cpx)*cfw_x + (oy - cpy)*cfw_y + (oz - cpz)*cfw_z;
         if (cz_center + r < 0.1f) continue;
 
-        float rx = mem->Obj_RTX[id], ry = mem->Obj_RTY[id], rz = mem->Obj_RTZ[id];
-        float ux = mem->Obj_UPX[id], uy = mem->Obj_UPY[id], uz = mem->Obj_UPZ[id];
-        float fx = mem->Obj_FWX[id], fy = mem->Obj_FWY[id], fz = mem->Obj_FWZ[id];
-        int vStart = mem->Obj_VertStart[id], vCount = mem->Obj_VertCount[id];
-        int tStart = mem->Obj_TriStart[id], tCount = mem->Obj_TriCount[id];
+        float rx = g_mem->Obj_RTX[id], ry = g_mem->Obj_RTY[id], rz = g_mem->Obj_RTZ[id];
+        float ux = g_mem->Obj_UPX[id], uy = g_mem->Obj_UPY[id], uz = g_mem->Obj_UPZ[id];
+        float fx = g_mem->Obj_FWX[id], fy = g_mem->Obj_FWY[id], fz = g_mem->Obj_FWZ[id];
+        int vStart = g_mem->Obj_VertStart[id], vCount = g_mem->Obj_VertCount[id];
+        int tStart = g_mem->Obj_TriStart[id], tCount = g_mem->Obj_TriCount[id];
 
         vmath_project_vertices(
             vCount,
-            mem->Vert_LX + vStart, mem->Vert_LY + vStart, mem->Vert_LZ + vStart,
-            mem->Vert_PX + vStart, mem->Vert_PY + vStart, mem->Vert_PZ + vStart, mem->Vert_Valid + vStart,
+            g_mem->Vert_LX + vStart, g_mem->Vert_LY + vStart, g_mem->Vert_LZ + vStart,
+            g_mem->Vert_PX + vStart, g_mem->Vert_PY + vStart, g_mem->Vert_PZ + vStart, g_mem->Vert_Valid + vStart,
             ox, oy, oz, rx, ry, rz, ux, uy, uz, fx, fy, fz,
             cpx, cpy, cpz, cfw_x, cfw_y, cfw_z, crt_x, crt_z, cup_x, cup_y, cup_z,
-            cam_fov, HALF_W, HALF_H
+            cam_fov,
+            g_half_w, g_half_h // USING CACHED RESOLUTION GLOBALS
         );
 
         vmath_process_triangles(
             tCount,
-            mem->Tri_V1 + tStart, mem->Tri_V2 + tStart, mem->Tri_V3 + tStart, mem->Vert_Valid,
-            mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ, mem->Vert_LX, mem->Vert_LY, mem->Vert_LZ,
-            mem->Tri_BakedColor + tStart, mem->Tri_ShadedColor + tStart, mem->Tri_Valid + tStart,
-
-            // THE BUG IS DEAD: Added + tStart to the Bounding Boxes
-            mem->Tri_MinY + tStart, mem->Tri_MaxY + tStart,
-
-            // THE NUCLEAR CACHE: Added + tStart to the Pre-Baked Normals
-            mem->Tri_LNX + tStart, mem->Tri_LNY + tStart, mem->Tri_LNZ + tStart,
-
+            g_mem->Tri_V1 + tStart, g_mem->Tri_V2 + tStart, g_mem->Tri_V3 + tStart, g_mem->Vert_Valid,
+            g_mem->Vert_PX, g_mem->Vert_PY, g_mem->Vert_PZ, g_mem->Vert_LX, g_mem->Vert_LY, g_mem->Vert_LZ,
+            g_mem->Tri_BakedColor + tStart, g_mem->Tri_ShadedColor + tStart, g_mem->Tri_Valid + tStart,
+            g_mem->Tri_MinY + tStart, g_mem->Tri_MaxY + tStart,
+            g_mem->Tri_LNX + tStart, g_mem->Tri_LNY + tStart, g_mem->Tri_LNZ + tStart,
             rx, ry, rz, ux, uy, uz, fx, fy, fz,
             sun_x, sun_y, sun_z
         );
     }
+
     // --- PHASE 1.5: THE BRANCHLESS QUAD-BINNER ---
     int band_counts[4] = {0, 0, 0, 0};
 
-    float q1 = CANVAS_H * 0.25f;
-    float q2 = CANVAS_H * 0.50f;
-    float q3 = CANVAS_H * 0.75f;
-
     for (int id = start_id; id <= end_id; id++) {
-        int tStart = mem->Obj_TriStart[id];
-        int tCount = mem->Obj_TriCount[id];
+        int tStart = g_mem->Obj_TriStart[id];
+        int tCount = g_mem->Obj_TriCount[id];
 
         for (int i = 0; i < tCount; i++) {
             int abs_i = tStart + i;
-            
-            // Highly predictable branch, perfectly safe to leave as-is
-            if (!mem->Tri_Valid[abs_i]) continue; 
 
-            float min_y = mem->Tri_MinY[abs_i];
-            float max_y = mem->Tri_MaxY[abs_i];
+            if (!g_mem->Tri_Valid[abs_i]) continue;
 
-            // 1. Evaluate conditions into pure integers (0 or 1). 
-            // Using bitwise & forces evaluation without short-circuit branching.
-            int m0 = (min_y < q1);
-            int m1 = (max_y >= q1) & (min_y < q2);
-            int m2 = (max_y >= q2) & (min_y < q3);
-            int m3 = (max_y >= q3);
+            float min_y = g_mem->Tri_MinY[abs_i];
+            float max_y = g_mem->Tri_MaxY[abs_i];
 
-            // 2. Unconditionally write the ID to all 4 lists. No branches!
+            // USING CACHED RESOLUTION GLOBALS
+            int m0 = (min_y < g_q1);
+            int m1 = (max_y >= g_q1) & (min_y < g_q2);
+            int m2 = (max_y >= g_q2) & (min_y < g_q3);
+            int m3 = (max_y >= g_q3);
+
             g_BandLists[0][band_counts[0]] = abs_i;
             g_BandLists[1][band_counts[1]] = abs_i;
             g_BandLists[2][band_counts[2]] = abs_i;
             g_BandLists[3][band_counts[3]] = abs_i;
 
-            // 3. Conditionally advance the pointers.
-            // If m0 is 0, the pointer doesn't move, and the data is overwritten next loop.
             band_counts[0] += m0;
             band_counts[1] += m1;
             band_counts[2] += m2;
             band_counts[3] += m3;
         }
     }
-    // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
-    float band_height = CANVAS_H * 0.25f; // Quick math for clip bounds
 
+    // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
     for (int b = 0; b < 4; b++) {
-        g_raster_payloads[b].display_list = g_BandLists[b]; 
+        g_raster_payloads[b].display_list = g_BandLists[b];
         g_raster_payloads[b].list_count = band_counts[b];
-        g_raster_payloads[b].mem = mem; 
-        g_raster_payloads[b].ScreenPtr = ScreenPtr; 
-        g_raster_payloads[b].ZBuffer = ZBuffer;
-        g_raster_payloads[b].CANVAS_W = CANVAS_W; 
-        g_raster_payloads[b].CANVAS_H = CANVAS_H;
-        g_raster_payloads[b].min_clip_y = (int)(b * band_height); 
-        g_raster_payloads[b].max_clip_y = (b == 3) ? CANVAS_H - 1 : (int)((b + 1) * band_height) - 1;
+
+        // WIRE THE PAYLOAD TO THE GLOBALS DIRECTLY
+        g_raster_payloads[b].mem = g_mem;
+        g_raster_payloads[b].ScreenPtr = g_screen_ptr;
+        g_raster_payloads[b].ZBuffer = g_z_buffer;
+        g_raster_payloads[b].CANVAS_W = g_canvas_w;
+        g_raster_payloads[b].CANVAS_H = g_canvas_h;
+
+        // USING CACHED RESOLUTION GLOBALS
+        g_raster_payloads[b].min_clip_y = (int)(b * g_band_height);
+        g_raster_payloads[b].max_clip_y = (b == 3) ? g_canvas_h - 1 : (int)((b + 1) * g_band_height) - 1;
 
         // WAKE UP BAND THREAD
         vmath_mutex_lock(&g_band_mutex[b]);
@@ -1752,12 +1784,12 @@ EXPORT void vmath_render_batch(
     // SYNCHRONIZATION: Sleep main thread until ALL 4 bands reply they are done
     for (int b = 0; b < 4; b++) {
         vmath_mutex_lock(&g_band_mutex[b]);
-        while (g_band_done[b] == 0) { 
-            vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]); 
+        while (g_band_done[b] == 0) {
+            vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]);
         }
         vmath_mutex_unlock(&g_band_mutex[b]);
-    }
 }
+
 // A dead-simple scalar sphere. No noise, no SIMD, purely a stable target for our Transition Weaving tests.
 EXPORT void vmath_generate_basic_sphere(float* lx, float* ly, float* lz, int latitudes, int longitudes, float radius) {
     int idx = 0;
@@ -1853,12 +1885,12 @@ THREAD_FUNC vmath_physics_worker(void* arg) {
     while (1) {
         // SLEEP UNTIL NEEDED
         vmath_mutex_lock(&g_phys_mutex);
-        while (g_phys_sig == 0) { 
-            vmath_cond_wait(&g_phys_cv_start, &g_phys_mutex); 
+        while (g_phys_sig == 0) {
+            vmath_cond_wait(&g_phys_cv_start, &g_phys_mutex);
         }
-        if (g_phys_sig == 2) { 
+        if (g_phys_sig == 2) {
             vmath_mutex_unlock(&g_phys_mutex);
-            break; 
+            break;
         }
         vmath_mutex_unlock(&g_phys_mutex);
 
@@ -1933,17 +1965,20 @@ THREAD_FUNC vmath_physics_worker(void* arg) {
 // ========================================================
 // MAIN DISPATCHER UPDATE
 // ========================================================
+// THE NEW COMMAND QUEUE: Only 5 arguments! Completely fits in fast registers.
 EXPORT void vmath_execute_queue(
-    int* queue, int command_count,
-    CameraState* cam, RenderMemory* mem,
-    uint32_t* ScreenPtr, float* ZBuffer,
-    int CANVAS_W, int CANVAS_H,
+    int command_count,
     float time, float dt,
     int read_idx, int write_idx
 ) {
+    // ZERO-IS-INITIALIZATION SAFETY CHECK
+    // If Lua hasn't bound the engine or there are no commands, do nothing safely.
+    if (!g_mem || !g_screen_ptr || command_count == 0) return;
+
+    // 1. Setup physics payload using GLOBALS
     g_physics_payload.command_count = command_count;
-    g_physics_payload.queue = queue;
-    g_physics_payload.mem = mem;
+    g_physics_payload.queue = g_queue;
+    g_physics_payload.mem = g_mem;
     g_physics_payload.time = time;
     g_physics_payload.dt = dt;
     g_physics_payload.read_idx = read_idx;
@@ -1956,36 +1991,43 @@ EXPORT void vmath_execute_queue(
     vmath_cond_broadcast(&g_phys_cv_start);
     vmath_mutex_unlock(&g_phys_mutex);
 
-    // ... [DO MAIN THREAD WORK (Command processing)] ...
-    // CORE 1 EXECUTES RENDER COMMANDS SIMULTANEOUSLY
-    float HALF_W = CANVAS_W * 0.5f;
-    float HALF_H = CANVAS_H * 0.5f;
+    // 2. Main Thread Render Loop
+    // No need to calculate HALF_W or HALF_H, they are in g_half_w / g_half_h
     float sun_x = 0.577f, sun_y = -0.577f, sun_z = 0.577f;
 
     for (int i = 0; i < command_count; i++) {
-        int opcode = queue[i];
+        int opcode = g_queue[i];
 
-        int swarm_count = mem->Obj_VertCount[0] / 4; // same here, vertex count must be 4 per particle
+        // Read directly from g_mem
+        int swarm_count = g_mem->Obj_VertCount[0] / 4;
+
         switch (opcode) {
             case 1: // CMD_CLEAR
-                vmath_clear_buffers(ScreenPtr, ZBuffer, 0xFF000000, 99999.0f, CANVAS_W * CANVAS_H);
+                vmath_clear_buffers(g_screen_ptr, g_z_buffer, 0xFF000000, 99999.0f, g_canvas_w * g_canvas_h);
                 break;
 
-            case 9: // SWARM_GEN_QUADS (Reads from R)
-                vmath_swarm_generate_quads(swarm_count, mem->Swarm_PX[read_idx], mem->Swarm_PY[read_idx], mem->Swarm_PZ[read_idx], mem->Vert_LX + mem->Obj_VertStart[0], mem->Vert_LY + mem->Obj_VertStart[0], mem->Vert_LZ + mem->Obj_VertStart[0], 120.0f, cam, HALF_W, HALF_H, mem->Swarm_Indices[read_idx]);
-                break;
-
-            case 10: // SPHERE_TICK
-                vmath_generate_basic_sphere(mem->Vert_LX + mem->Obj_VertStart[1], mem->Vert_LY + mem->Obj_VertStart[1], mem->Vert_LZ + mem->Obj_VertStart[1], 100, 100, 3500.0f);
+            case 9: // SWARM_GEN_QUADS
+                vmath_swarm_generate_quads(
+                    swarm_count,
+                    g_mem->Swarm_PX[read_idx], g_mem->Swarm_PY[read_idx], g_mem->Swarm_PZ[read_idx],
+                    g_mem->Vert_LX + g_mem->Obj_VertStart[0],
+                    g_mem->Vert_LY + g_mem->Obj_VertStart[0],
+                    g_mem->Vert_LZ + g_mem->Obj_VertStart[0],
+                    120.0f,
+                    g_cam, g_half_w, g_half_h // USING GLOBALS
+                );
                 break;
 
             case 11: { // RENDER
-                int id = queue[++i];
-                vmath_render_batch(id, id, cam, HALF_W, HALF_H, sun_x, sun_y, sun_z, mem, ScreenPtr, ZBuffer, CANVAS_W, CANVAS_H);
+                int id = g_queue[++i];
+                // Strip the render batch signature down too!
+                // It only needs 'id' and 'sun' now, because it can read the rest from globals!
+                vmath_render_batch(id, id, sun_x, sun_y, sun_z);
                 break;
             }
         }
     }
+
     // WAIT FOR PHYSICS TO FINISH
     vmath_mutex_lock(&g_phys_mutex);
     while (g_phys_done == 0) {
@@ -1993,6 +2035,7 @@ EXPORT void vmath_execute_queue(
     }
     vmath_mutex_unlock(&g_phys_mutex);
 }
+
 // ========================================================
 // BOOT & SHUTDOWN (The Mutex Initializers)
 // ========================================================
@@ -2002,8 +2045,8 @@ EXPORT void vmath_init_thread_pool() {
 
     // Initialize N-Bands
     for (int b = 0; b < NUM_BANDS; b++) {
-        vmath_mutex_init(&g_band_mutex[b]); 
-        vmath_cond_init(&g_band_cv_start[b]);  
+        vmath_mutex_init(&g_band_mutex[b]);
+        vmath_cond_init(&g_band_cv_start[b]);
         vmath_cond_init(&g_band_cv_done[b]);
         g_band_sig[b] = 0;
         g_band_done[b] = 1;
@@ -2020,15 +2063,15 @@ EXPORT void vmath_shutdown_thread_pool() {
 
     // Shutdown N-Bands
     for (int b = 0; b < NUM_BANDS; b++) {
-        vmath_mutex_lock(&g_band_mutex[b]);  
-        g_band_sig[b] = 2;  
-        vmath_cond_broadcast(&g_band_cv_start[b]);  
+        vmath_mutex_lock(&g_band_mutex[b]);
+        g_band_sig[b] = 2;
+        vmath_cond_broadcast(&g_band_cv_start[b]);
         vmath_mutex_unlock(&g_band_mutex[b]);
 
         vmath_thread_join(g_raster_threads[b]);
 
-        vmath_mutex_destroy(&g_band_mutex[b]);  
-        vmath_cond_destroy(&g_band_cv_start[b]);  
+        vmath_mutex_destroy(&g_band_mutex[b]);
+        vmath_cond_destroy(&g_band_cv_start[b]);
         vmath_cond_destroy(&g_band_cv_done[b]);
     }
 }

@@ -84,7 +84,7 @@ int g_phys_done = 1;
 
 // --- [N-BAND RASTER STATE] ---
 #define NUM_BANDS 4
-#define MAX_DISP_TRIS_PER_BAND 1000000 // 24MB total RAM. Completely bulletproof.
+#define MAX_DISP_TRIS_PER_BAND 4000000
 
 vmath_mutex_t g_band_mutex[NUM_BANDS];
 vmath_cond_t  g_band_cv_start[NUM_BANDS];
@@ -302,7 +302,7 @@ EXPORT void vmath_clear_buffers(
     }
 }
 // ========================================================
-// THE 500K POINT CLOUD RENDERER
+// THE 500K POINT CLOUD RENDERER (AVX2 ACCELERATED)
 // ========================================================
 EXPORT void vmath_render_point_cloud(
     int count, 
@@ -315,64 +315,137 @@ EXPORT void vmath_render_point_cloud(
     float cup_x = g_cam->upx, cup_y = g_cam->upy, cup_z = g_cam->upz;
     float cam_fov = g_cam->fov;
     
-    // We will borrow Vert_PX, PY, PZ to store the screen coords so we don't need new memory
     float* sx = g_mem->Vert_PX;
     float* sy = g_mem->Vert_PY;
     float* sz = g_mem->Vert_PZ;
 
     int band_counts[4] = {0, 0, 0, 0};
 
-    // --- PHASE 1: AVX2 DIRECT PROJECTION ---
+    // --- AVX SETUP: Broadcast everything into 256-bit registers ---
+    __m256 v_cpx = _mm256_set1_ps(cpx), v_cpy = _mm256_set1_ps(cpy), v_cpz = _mm256_set1_ps(cpz);
+    __m256 v_cfwx = _mm256_set1_ps(cfw_x), v_cfwy = _mm256_set1_ps(cfw_y), v_cfwz = _mm256_set1_ps(cfw_z);
+    __m256 v_crtx = _mm256_set1_ps(crt_x), v_crtz = _mm256_set1_ps(crt_z);
+    __m256 v_cupx = _mm256_set1_ps(cup_x), v_cupy = _mm256_set1_ps(cup_y), v_cupz = _mm256_set1_ps(cup_z);
+    __m256 v_fov = _mm256_set1_ps(cam_fov);
+    
+    __m256 v_hw = _mm256_set1_ps(g_half_w);
+    __m256 v_hh = _mm256_set1_ps(g_half_h);
+    __m256 v_w = _mm256_set1_ps((float)g_canvas_w);
+    __m256 v_h = _mm256_set1_ps((float)g_canvas_h);
+    __m256 v_zero = _mm256_setzero_ps();
+    __m256 v_0_1 = _mm256_set1_ps(0.1f);
+    __m256 v_two = _mm256_set1_ps(2.0f);
+
     int i = 0;
-    for (; i < count; i++) {
-        float dx = px[i] - cpx;
-        float dy = py[i] - cpy;
-        float dz = pz[i] - cpz;
+    
+    // --- PHASE 1: AVX2 8-WIDE PROJECTION LOOP ---
+    for (; i <= count - 8; i += 8) {
+        __m256 v_px = _mm256_loadu_ps(&px[i]);
+        __m256 v_py = _mm256_loadu_ps(&py[i]);
+        __m256 v_pz = _mm256_loadu_ps(&pz[i]);
+
+        __m256 dx = _mm256_sub_ps(v_px, v_cpx);
+        __m256 dy = _mm256_sub_ps(v_py, v_cpy);
+        __m256 dz = _mm256_sub_ps(v_pz, v_cpz);
         
+        __m256 cz = _mm256_fmadd_ps(dz, v_cfwz, _mm256_fmadd_ps(dy, v_cfwy, _mm256_mul_ps(dx, v_cfwx)));
+        
+        // Z-Culling Mask
+        __m256 mask_z = _mm256_cmp_ps(cz, v_0_1, _CMP_GE_OQ);
+        
+        // FAST HARDWARE DIVISION (Newton-Raphson approximation)
+        // Eliminates 8 slow float divisions in favor of fast multiplication!
+        __m256 rcp = _mm256_rcp_ps(cz);
+        rcp = _mm256_mul_ps(rcp, _mm256_fnmadd_ps(cz, rcp, v_two));
+        __m256 f = _mm256_mul_ps(v_fov, rcp);
+
+        // Project X and Y
+        __m256 screen_x = _mm256_fmadd_ps(f, _mm256_fmadd_ps(dz, v_crtz, _mm256_mul_ps(dx, v_crtx)), v_hw);
+        __m256 screen_y = _mm256_fmadd_ps(f, _mm256_fmadd_ps(dz, v_cupz, _mm256_fmadd_ps(dy, v_cupy, _mm256_mul_ps(dx, v_cupx))), v_hh);
+
+        // Bounds Checking Masks
+        __m256 mask_x = _mm256_and_ps(_mm256_cmp_ps(screen_x, v_zero, _CMP_GE_OQ), _mm256_cmp_ps(screen_x, v_w, _CMP_LT_OQ));
+        __m256 mask_y = _mm256_and_ps(_mm256_cmp_ps(screen_y, v_zero, _CMP_GE_OQ), _mm256_cmp_ps(screen_y, v_h, _CMP_LT_OQ));
+        
+        // Combine all masks (Z, X, and Y limits)
+        __m256 mask_all = _mm256_and_ps(mask_z, _mm256_and_ps(mask_x, mask_y));
+        
+        // Extract to an 8-bit integer (1 = Valid, 0 = Off-screen)
+        int bitmask = _mm256_movemask_ps(mask_all);
+
+        // Store unconditionally to arrays (it's faster than masked storing)
+        _mm256_storeu_ps(&sx[i], screen_x);
+        _mm256_storeu_ps(&sy[i], screen_y);
+        _mm256_storeu_ps(&sz[i], cz);
+
+        // FAST FORWARD: If all 8 particles are off screen, just skip to the next batch!
+        if (bitmask == 0) {
+            for (int j = 0; j < 8; j++) g_mem->Vert_Valid[i + j] = false;
+            continue;
+        }
+
+        // We pull the 8 screen Y values into an array so we can branchless-bin them quickly
+        float temp_sy[8];
+        _mm256_storeu_ps(temp_sy, screen_y);
+
+        // --- PHASE 1.5: THE QUAD BINNER ---
+        for (int j = 0; j < 8; j++) {
+            bool valid = (bitmask & (1 << j)) != 0;
+            g_mem->Vert_Valid[i + j] = valid;
+
+            if (valid) {
+                int abs_i = i + j;
+                float s_y = temp_sy[j];
+
+                int m0 = (s_y < g_q1);
+                int m1 = (s_y >= g_q1) & (s_y < g_q2);
+                int m2 = (s_y >= g_q2) & (s_y < g_q3);
+                int m3 = (s_y >= g_q3);
+
+                g_BandLists[0][band_counts[0]] = abs_i;
+                g_BandLists[1][band_counts[1]] = abs_i;
+                g_BandLists[2][band_counts[2]] = abs_i;
+                g_BandLists[3][band_counts[3]] = abs_i;
+
+                band_counts[0] += m0;
+                band_counts[1] += m1;
+                band_counts[2] += m2;
+                band_counts[3] += m3;
+            }
+        }
+    }
+
+    // --- TAIL LOOP (For remainders) ---
+    for (; i < count; i++) {
+        float dx = px[i] - cpx, dy = py[i] - cpy, dz = pz[i] - cpz;
         float cz = dx*cfw_x + dy*cfw_y + dz*cfw_z;
 
-        // Behind camera? Skip it completely.
-        if (cz < 0.1f) {
-            g_mem->Vert_Valid[i] = false;
-            continue; 
-        }
+        if (cz < 0.1f) { g_mem->Vert_Valid[i] = false; continue; }
 
         float f = cam_fov / cz;
         float screen_x = g_half_w + (dx*crt_x + dz*crt_z) * f;
         float screen_y = g_half_h + (dx*cup_x + dy*cup_y + dz*cup_z) * f;
 
-        // Out of screen bounds? Skip it.
         if (screen_x < 0 || screen_x >= g_canvas_w || screen_y < 0 || screen_y >= g_canvas_h) {
             g_mem->Vert_Valid[i] = false;
             continue;
         }
 
-        // Store the valid screen coordinates
-        sx[i] = screen_x;
-        sy[i] = screen_y;
-        sz[i] = cz;
+        sx[i] = screen_x; sy[i] = screen_y; sz[i] = cz;
         g_mem->Vert_Valid[i] = true;
 
-        // --- PHASE 1.5: THE QUAD BINNER ---
-        // Instantly sort the valid point into its correct Raster Thread Band
         int m0 = (screen_y < g_q1);
         int m1 = (screen_y >= g_q1) & (screen_y < g_q2);
         int m2 = (screen_y >= g_q2) & (screen_y < g_q3);
         int m3 = (screen_y >= g_q3);
 
-        g_BandLists[0][band_counts[0]] = i;
-        g_BandLists[1][band_counts[1]] = i;
-        g_BandLists[2][band_counts[2]] = i;
-        g_BandLists[3][band_counts[3]] = i;
+        g_BandLists[0][band_counts[0]] = i; g_BandLists[1][band_counts[1]] = i;
+        g_BandLists[2][band_counts[2]] = i; g_BandLists[3][band_counts[3]] = i;
 
-        band_counts[0] += m0;
-        band_counts[1] += m1;
-        band_counts[2] += m2;
-        band_counts[3] += m3;
+        band_counts[0] += m0; band_counts[1] += m1; band_counts[2] += m2; band_counts[3] += m3;
     }
 
     // --- PHASE 2: WAKE UP THREADS TO PLOT PIXELS ---
-    // (We will write a new worker function for this, but dispatch looks identical)
     for (int b = 0; b < 4; b++) {
         g_raster_payloads[b].display_list = g_BandLists[b];
         g_raster_payloads[b].list_count = band_counts[b];
@@ -381,12 +454,11 @@ EXPORT void vmath_render_point_cloud(
         g_raster_payloads[b].ZBuffer = g_z_buffer;
         g_raster_payloads[b].CANVAS_W = g_canvas_w;
         
-        // We temporarily hijack the "min_clip_y" payload variable to pass the color!
         g_raster_payloads[b].min_clip_y = color; 
 
         vmath_mutex_lock(&g_band_mutex[b]);
         g_band_done[b] = 0;
-        g_band_sig[b] = 3; // <--- NEW SIGNAL: '3' MEANS DRAW POINTS!
+        g_band_sig[b] = 3; 
         vmath_cond_broadcast(&g_band_cv_start[b]);
         vmath_mutex_unlock(&g_band_mutex[b]);
     }
